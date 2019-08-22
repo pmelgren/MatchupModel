@@ -1,0 +1,126 @@
+---
+title: "XGBoost Matchup Model"
+author: "Pete Melgren"
+date: "August 21, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(RODBC)
+library(retrosheet) # installed from github.com/rmscriven/retrosheet
+library(baseballr) # installed from github.com/BillPetti/baseballr
+library(data.table) # use data.table package to optimize speed
+```
+
+## Data Preparation
+
+Begin by bringing in the event data from the publicly available retrosheet database. Instructions on bringing retrosheet into an SQL table can be found [here](github.com/pmelgren/baseballdatabase) or [here](https://tht.fangraphs.com/databases-for-sabermetricians-part-one/).
+
+Next import the statcast data and aggregate relevant variables by player and pitch type.
+```{r scrape data}
+#import statcast data in multiple chunks to prevent timeout. This will take a few minutes.
+if(!exists("sc")){ # use this if statement to prevent unnecessarily scraping the same data multiple times so as to not abuse the site.
+  sc = data.frame()
+  start = as.Date("2018-03-29")
+  end = start+6
+  while(start < as.Date("2018-10-01")){
+    sc = rbind(sc,scrape_statcast_savant(start,end))
+    start = start + 7
+    end = end + 7
+  }
+}
+
+# set sc to a data.table to optimize for speed
+sc = data.table(sc)
+
+# add binary indicators for if the pitch was in-zone and if the batter swung
+sc[,inzone := ifelse(abs(plate_x)<.75 & plate_z<sz_top & plate_z>sz_bot, 1, 0)]
+sc[grep("hit_in?|swing?|foul|foul?|?bunt",description),swing := 1]
+sc[is.na(swing), swing := 0]
+sc[grep("?ball|hit_by_pitch|pitchout",description),strike := 0]
+sc[is.na(strike), strike := 1]
+```
+
+```{r aggregate pitchers}
+# aggregate pitcher data into a few key metrics
+p_agg = sc[,list(P.pit = length(batter)
+                 ,wOBA.pit = sum(woba_value,na.rm = TRUE) /
+                   sum(woba_denom,na.rm = TRUE)
+                 ,FF_pct = mean(pitch_type == "FF",na.rm = TRUE)
+                 ,SI_pct = mean(pitch_type == "SI",na.rm = TRUE)
+                 ,SL_pct = mean(pitch_type == "SL",na.rm = TRUE)
+                 ,CH_pct = mean(pitch_type %in% c("CH","FS"),na.rm = TRUE)
+                 ,CB_pct = mean(pitch_type %in% c("CU","KC"),na.rm = TRUE)
+                 ,FB_Velo = mean(ifelse(pitch_type %in% c("FF","SI")
+                                        ,release_speed,NA),na.rm = TRUE)
+                 ,SL_Velo = mean(ifelse(pitch_type == "SL"
+                                        ,release_speed,NA),na.rm = TRUE)
+                 ,SL_Spin = mean(ifelse(pitch_type == "SL"
+                                        ,release_spin_rate,NA),na.rm = TRUE)
+                 ,CB_Spin = mean(ifelse(pitch_type %in% c("CU","KC")
+                                        ,release_spin_rate,NA),na.rm = TRUE)
+                 ,Extension = mean(release_extension,na.rm =TRUE)
+                 ,LA = mean(launch_angle,na.rm = TRUE)
+                 ,Strike_pct = mean(strike,na.rm = TRUE)
+                 ,Zone_pct = mean(zone,na.rm = TRUE))
+           ,by = pitcher]
+str(p_agg)
+summary(p_agg)
+```
+
+```{r aggregate batters}
+# aggregate batter data
+b_agg = sc[,list(P.bat = length(pitcher)
+                 ,wOBA.bat = sum(woba_value,na.rm = TRUE) / 
+                   sum(woba_denom,na.rm = TRUE)
+                 ,Exit_velo = mean(launch_speed,na.rm = TRUE)
+                 ,LA = mean(launch_angle,na.rm = TRUE)
+                 ,Swing_pct = sum(swing)/length(pitcher)
+                 ,Whiff = sum(description == "swinging_strike")/sum(swing)
+                 ,Chase = sum(swing*(1-inzone),na.rm = TRUE)/length(pitcher)
+                 ,Zcontact = (sum(inzone*swing*(description != "swinging_strike")
+                                  ,na.rm = TRUE)/sum(inzone*swing,na.rm = TRUE)))
+           ,by = batter]
+str(b_agg)
+summary(b_agg)
+```
+
+```{r event data}
+events = sc[woba_denom == 1
+            ,list(pitcher,batter,inning,outs = outs_when_up
+                  ,score_diff = home_score-away_score)]
+str(events)
+summary(events)
+```
+
+To account for pitchers and batters with a really small smaple size, we want to mask the ID of any pitcher or batter that doesn't meet a certain pitch threshhold.
+
+We'll begin by plotting density of pitchers and batters by pitch_count to try to get a good idea of what a reasonable masking threshhold might be.
+```{r Masking Plot}
+plot_dat = data.table(P = p_agg$P.pit, position = "Pitcher")
+plot_dat = rbind(plot_dat,data.table(P= b_agg$P.bat, position = "Batter"))
+ggplot(plot_dat,aes(x = P, color = position, fill = position )) + 
+  stat_ecdf(size = 1)
+```
+
+Based on this, it looks like 200 pitches is a reasonable cutoff to mask the ID's of both pitchers and batters. Although it will mask more batters, there are more total batters in the sample. Just to verify this Let's look at how many players will remain unmasked for each catergory
+```{r Unmasked numbers}
+print(paste("Pitchers:",nrow(p_agg)-nrow(p_agg[P.pit < 200])," of ",nrow(p_agg)))
+print(paste("Batters:",nrow(b_agg)-nrow(b_agg[P.bat < 200])," of ",nrow(b_agg)))
+```
+
+We lose a highpercentage of batters, but still have a large number of players in each category, so we'll stick with 200.
+```{r Masking}
+p_agg[P.pit < 200, pitcher := 0]
+b_agg[P.bat < 200, batter := 0]
+```
+
+Now with the amsking done, we can combine the 3 tables into one table that we'll use to train the model.
+```{r Join Data}
+model_dat = merge(events,p_agg,by = c("pitcher"))
+model_dat = merge(model_dat,b_agg,by = c("batter"))
+str(model_dat)
+summary(model_dat)
+```
+
