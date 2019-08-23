@@ -7,10 +7,10 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-library(RODBC)
-library(retrosheet) # installed from github.com/rmscriven/retrosheet
 library(baseballr) # installed from github.com/BillPetti/baseballr
 library(data.table) # use data.table package to optimize speed
+library(ggplot2)
+library(Matrix)
 ```
 
 ## Data Preparation
@@ -33,6 +33,9 @@ if(!exists("sc")){ # use this if statement to prevent unnecessarily scraping the
 
 # set sc to a data.table to optimize for speed
 sc = data.table(sc)
+
+# filter out only regular season
+sc = sc[game_type == "R"]
 
 # add binary indicators for if the pitch was in-zone and if the batter swung
 sc[,inzone := ifelse(abs(plate_x)<.75 & plate_z<sz_top & plate_z>sz_bot, 1, 0)]
@@ -61,7 +64,7 @@ p_agg = sc[,list(P.pit = length(batter)
                  ,CB_Spin = mean(ifelse(pitch_type %in% c("CU","KC")
                                         ,release_spin_rate,NA),na.rm = TRUE)
                  ,Extension = mean(release_extension,na.rm =TRUE)
-                 ,LA = mean(launch_angle,na.rm = TRUE)
+                 ,LA.pit = mean(launch_angle,na.rm = TRUE)
                  ,Strike_pct = mean(strike,na.rm = TRUE)
                  ,Zone_pct = mean(zone,na.rm = TRUE))
            ,by = pitcher]
@@ -75,7 +78,7 @@ b_agg = sc[,list(P.bat = length(pitcher)
                  ,wOBA.bat = sum(woba_value,na.rm = TRUE) / 
                    sum(woba_denom,na.rm = TRUE)
                  ,Exit_velo = mean(launch_speed,na.rm = TRUE)
-                 ,LA = mean(launch_angle,na.rm = TRUE)
+                 ,LA.bat = mean(launch_angle,na.rm = TRUE)
                  ,Swing_pct = sum(swing)/length(pitcher)
                  ,Whiff = sum(description == "swinging_strike")/sum(swing)
                  ,Chase = sum(swing*(1-inzone),na.rm = TRUE)/length(pitcher)
@@ -89,38 +92,116 @@ summary(b_agg)
 ```{r event data}
 events = sc[woba_denom == 1
             ,list(pitcher,batter,inning,outs = outs_when_up
-                  ,score_diff = home_score-away_score)]
+                  ,score_diff = home_score-away_score
+                  ,base_state = as.factor(paste0(ifelse(is.na(on_1b),"1","_")
+                                                 ,ifelse(is.na(on_2b),"2","_")
+                                                 ,ifelse(is.na(on_3b),"3","_")))
+                  ,on_base = ifelse(woba_value > 0,1,0)
+                  )
+            ]
 str(events)
 summary(events)
 ```
 
-To account for pitchers and batters with a really small smaple size, we want to mask the ID of any pitcher or batter that doesn't meet a certain pitch threshhold.
+With our 3 tables in place, we can now combine them into one table that we'll use to train the model.
+```{r Join Data}
+model_dat = merge(events,p_agg,by = c("pitcher"))
+model_dat = merge(model_dat,b_agg,by = c("batter"))
 
-We'll begin by plotting density of pitchers and batters by pitch_count to try to get a good idea of what a reasonable masking threshhold might be.
-```{r Masking Plot}
-plot_dat = data.table(P = p_agg$P.pit, position = "Pitcher")
-plot_dat = rbind(plot_dat,data.table(P= b_agg$P.bat, position = "Batter"))
-ggplot(plot_dat,aes(x = P, color = position, fill = position )) + 
-  stat_ecdf(size = 1)
+str(model_dat)
+summary(model_dat)
 ```
 
-Based on this, it looks like 200 pitches is a reasonable cutoff to mask the ID's of both pitchers and batters. Although it will mask more batters, there are more total batters in the sample. Just to verify this Let's look at how many players will remain unmasked for each catergory
+Right away we notice that the pitcher and batter id's are treated as numeric data when they should be categorical. But before we do that conversion, we also need to account for the pitchers and batters that have a really small sample size. So what we'll do is mask the ID of any pitcher or batter that doesn't meet a certain pitch threshold. So let's explore what that threshold should be.
+
+We'll begin by plotting density of pitchers and batters by pitch_count to try to get a good idea of what a reasonable masking threshold might be.
+```{r Masking Plot}
+plot_dat = data.table(P = p_agg$P.pit, Position = "Pitcher")
+plot_dat = rbind(plot_dat,data.table(P= b_agg$P.bat, Position = "Batter"))
+ggplot(plot_dat,aes(x = P, color = Position)) + 
+  stat_ecdf(size = 1) + 
+  labs(y = "Cumulative Percentage"
+       ,title = "Cumulative Percentage of Players by Pitch Threshold")
+rm(plot_dat)
+```
+
+Based on this, it looks like 200 pitches is a reasonable cutoff to mask the ID's of both pitchers and batters. Although it will mask more batters, there are more total batters in the sample. Just to verify this Let's look at how many players will remain unmasked for each catergory.
 ```{r Unmasked numbers}
 print(paste("Pitchers:",nrow(p_agg)-nrow(p_agg[P.pit < 200])," of ",nrow(p_agg)))
 print(paste("Batters:",nrow(b_agg)-nrow(b_agg[P.bat < 200])," of ",nrow(b_agg)))
 ```
 
-We lose a highpercentage of batters, but still have a large number of players in each category, so we'll stick with 200.
+We lose a high percentage of batters, but still have a large number of players in each category, so we'll stick with 200. Then once we've masked these players we can go ahead and convert the variables to categrical.
 ```{r Masking}
-p_agg[P.pit < 200, pitcher := 0]
-b_agg[P.bat < 200, batter := 0]
+# mask pitcher and batter ID's with fewer than 200 pitches
+model_dat[P.pit < 200, pitcher := 0]
+model_dat[P.bat < 200, batter := 0]
+
+# convert to factors to indicate they're categorical variables
+model_dat[,pitcher := as.factor(as.character(pitcher))]
+model_dat[,batter := as.factor(as.character(batter))]
+
+str(model_dat)
 ```
 
-Now with the amsking done, we can combine the 3 tables into one table that we'll use to train the model.
-```{r Join Data}
-model_dat = merge(events,p_agg,by = c("pitcher"))
-model_dat = merge(model_dat,b_agg,by = c("batter"))
-str(model_dat)
-summary(model_dat)
+Now that our data is ready, we can prepare it for our model by converting to a matrix. We're going to use a sparse matrix given the high number of categorical columns in our data.
+
+```{r Convert to Matrix}
+options(na.action='na.pass')
+train_dat = sparse.model.matrix(on_base~.,data = model_dat)
+dim(train_dat)
+```
+
+Now we'll set up an initial grid search. R doesn't have good support of grid search functionality for sparse model matrixes so we'll do it manually using a for loop.
+
+The first thing we want to determine is the optimum tree depth (interactions). So we'll begin by searching over tree depths of various lengths with a high learning rate.
+
+```{r First Grid Search}
+# Set the preliminary tuning parameters
+d = seq(1,7,2)
+lr = c(0.3,.1,.05)
+
+#create a data frame to store the output of the tuning exercies
+tune_results = data.frame(depth = 0,lr = 0.0,min_error = 0,best_iter = 0)
+tunecv = list()
+rnum = 1
+
+# begin by identifying the best tree depth
+for(i in 1:length(d)){
+  for(j in 1:length(lr)){
+    
+    print(paste("Depth of",d[i],"and learning rate of",lr[j]))
+    
+    # calculate cross-validated tuning metrics
+    tunecv[[rnum]] = xgb.cv(data = train_dat
+                            ,label = model_dat$on_base
+                            ,max.depth = d[i]
+                            ,eta = lr[j]
+                            ,nround = 15000
+                            ,objective = "binary:logistic"
+                            ,nfold = 5
+                            ,verbose = TRUE
+                            ,early_stopping_rounds = 100
+                            ,print_every_n = 100
+                            )
+    
+    #add data to the output variable
+    tune_results[rnum,] = c(d[i],lr[j]
+        ,min(tunecv[[rnum]]$evaluation_log$test_error_mean)
+        ,tunecv[[rnum]]$best_iter)
+    rnum = rnum+1
+  }
+}
+```
+```{r}
+plotdat = data.table()
+for(i in 1:length(tunecv)){
+  plotdat = rbind(plotdat
+                  ,data.table(test_error = tunecv[[i]]$evaluation_log$test_error_mean
+                              ,params = paste0("d:",tunecv[[i]]$params$max_depth
+                                               ,"_lr:",tunecv[[i]]$params$eta)
+                              ,iter = tunecv[[i]]$evaluation_log$iter))
+}
+ggplot(plotdat,aes(iter,test_error,color = params))+geom_line()
 ```
 
