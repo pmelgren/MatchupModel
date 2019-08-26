@@ -19,7 +19,7 @@ library(xgboost)
 Begin by bringing in the event data from the publicly available retrosheet database. Instructions on bringing retrosheet into an SQL table can be found [here](github.com/pmelgren/baseballdatabase) or [here](https://tht.fangraphs.com/databases-for-sabermetricians-part-one/).
 
 Next import the statcast data and aggregate relevant variables by player and pitch type.
-```{r scrape data}
+```{r scrape data, cache = TRUE}
 #import statcast data in multiple chunks to prevent timeout. This will take a few minutes.
 if(!exists("sc")){ # use this if statement to prevent unnecessarily scraping the same data multiple times so as to not abuse the site.
   sc = data.frame()
@@ -92,12 +92,16 @@ summary(b_agg)
 
 ```{r event data}
 events = sc[woba_denom == 1
-            ,list(pitcher,batter,inning,outs = outs_when_up
+            ,list(pitcher,batter,inning
+                  ,outs = outs_when_up
+                  ,b_side = stand
+                  ,p_throws
                   ,score_diff = home_score-away_score
                   ,base_state = as.factor(paste0(ifelse(is.na(on_1b),"1","_")
                                                  ,ifelse(is.na(on_2b),"2","_")
                                                  ,ifelse(is.na(on_3b),"3","_")))
                   ,woba_value
+                  
                   )
             ]
 str(events)
@@ -105,7 +109,7 @@ summary(events)
 ```
 
 With our 3 tables in place, we can now combine them into one table that we'll use to train the model.
-```{r Join Data}
+```{r join datasets}
 model_dat = merge(events,p_agg,by = c("pitcher"))
 model_dat = merge(model_dat,b_agg,by = c("batter"))
 
@@ -116,7 +120,7 @@ summary(model_dat)
 Right away we notice that the pitcher and batter id's are treated as numeric data when they should be categorical. But before we do that conversion, we also need to account for the pitchers and batters that have a really small sample size. So what we'll do is mask the ID of any pitcher or batter that doesn't meet a certain pitch threshold. So let's explore what that threshold should be.
 
 We'll begin by plotting density of pitchers and batters by pitch_count to try to get a good idea of what a reasonable masking threshold might be.
-```{r Masking Plot}
+```{r masking eploration plot}
 plot_dat = data.table(P = p_agg$P.pit, Position = "Pitcher")
 plot_dat = rbind(plot_dat,data.table(P= b_agg$P.bat, Position = "Batter"))
 ggplot(plot_dat,aes(x = P, color = Position)) + 
@@ -127,13 +131,13 @@ rm(plot_dat)
 ```
 
 Based on this, it looks like 200 pitches is a reasonable cutoff to mask the ID's of both pitchers and batters. Although it will mask more batters, there are more total batters in the sample. Just to verify this Let's look at how many players will remain unmasked for each catergory.
-```{r Unmasked numbers}
+```{r unmasked numbers}
 print(paste("Pitchers:",nrow(p_agg)-nrow(p_agg[P.pit < 200])," of ",nrow(p_agg)))
 print(paste("Batters:",nrow(b_agg)-nrow(b_agg[P.bat < 200])," of ",nrow(b_agg)))
 ```
 
 We lose a high percentage of batters, but still have a large number of players in each category, so we'll stick with 200. Then once we've masked these players we can go ahead and convert the variables to categrical.
-```{r Masking}
+```{r masking}
 # mask pitcher and batter ID's with fewer than 200 pitches
 model_dat[P.pit < 200, pitcher := 0]
 model_dat[P.bat < 200, batter := 0]
@@ -147,7 +151,7 @@ str(model_dat)
 
 Now that our data is ready, we can prepare it for our model by converting to a matrix. We're going to use a sparse matrix given the high number of categorical columns in our data.
 
-```{r Convert to Matrix}
+```{r convert to matrix}
 options(na.action='na.pass')
 train_dat = sparse.model.matrix(woba_value~.,data = model_dat)
 dim(train_dat)
@@ -157,16 +161,14 @@ Now we'll set up an initial grid search. R doesn't have good support of grid sea
 
 The first thing we want to determine is the optimum tree depth (interactions). So we'll begin by searching over tree depths of various lengths with a high learning rate.
 
-```{r Set Up Grid Search}
+```{r first grid search, cache=TRUE}
 #create a data frame to store the output of the tuning exercies
 tune_results = data.frame()
 tunecv = list()
 rnum = 1
-```
 
-```{r First Grid Search}
 # Set the preliminary tuning parameters
-d = seq(1,3,2)
+d = seq(1,7,2)
 lr = c(.1)
 
 # begin by identifying the best tree depth
@@ -198,7 +200,7 @@ for(i in 1:length(d)){
   }
 }
 ```
-```{r Plot First Grid Search}
+```{r plot first grid search}
 plotdat = data.table()
 for(i in 1:length(tunecv)){
   plotdat = rbind(plotdat
@@ -207,16 +209,17 @@ for(i in 1:length(tunecv)){
                                                ,"_lr:",tunecv[[i]]$params$eta)
                               ,iter = tunecv[[i]]$evaluation_log$iter))
 }
-ggplot(plotdat,aes(iter,test_rmse,color = params))+geom_line() 
+ggplot(plotdat,aes(iter,test_rmse,color = params))+ geom_line() + 
+  coord_cartesian(ylim = c(.511,.52))
 
 plotdat[test_rmse == min(test_rmse)]
 ```
 
 We'll refine the grid search now by eliminating the larger tree depths that didn't perform well and trying lower learning rates.
 
-```{r Second Grid Search}
+```{r second grid search, cache = TRUE}
 # Set the preliminary tuning parameters
-d = 1:2
+d = 1:3
 lr = c(.05,.025,.01)
 
 # begin by identifying the best tree depth
@@ -248,7 +251,7 @@ for(i in 1:length(d)){
   }
 }
 ```
-```{r Plot Second Grid Search}
+```{r plot second grid search}
 plotdat = data.table()
 for(i in 1:length(tunecv)){
   if(tunecv[[i]]$params$max_depth <= 3){
@@ -259,25 +262,26 @@ for(i in 1:length(tunecv)){
                               ,iter = tunecv[[i]]$evaluation_log$iter))
   }
 }
-ggplot(plotdat[test_rmse < .51142],aes(iter,test_rmse,color = params))+geom_line() + 
-  coord_cartesian(ylim = c(.5113,.5115))
+ggplot(plotdat,aes(iter,test_rmse,color = params))+geom_line() + 
+  coord_cartesian(ylim = c(.511,.512))
 
-plotdat[test_rmse == min(test_rmse)]
+best = which(tune_results$min_err == min(tune_results$min_err))
+tune_results[best,]
 ```
 
-```{r Train Model}
+```{r train model}
 model.xgb = xgboost(data = train_dat
                     ,label = model_dat$woba_value
-                    ,max.depth = 2
-                    ,eta = .025
-                    ,nround = 342
+                    ,max.depth = tune_results$depth[best]
+                    ,eta = tune_results$lr[best]
+                    ,nround = tune_results$best_iter[best]
                     ,objective = "reg:squarederror"
                     ,metric = "rmse"
                     ,verbose = TRUE
                     ,print_every_n = 50)
 ```
 
-```{r Feature Importance}
+```{r feature importance}
 imp = xgb.importance(train_dat@Dimnames[[2]], model = model.xgb)
 imp
 ```
@@ -285,7 +289,7 @@ imp
 A few things stand out. First of all, 97% of the model gain is explained by pitcher and batter average wOBA. It makes sense that wOBA at a aggregate level would explain wOBA at a plate-appearance level. It also helps to explain why the model gains are so small after the initial iteration. 
 Secondly, we see that only 55 of the 1180 features are used at all. My suspicion is that the unused features are almost entirely pitcher and batter id's, but let's verify this. 
 
-```{r Explore Unused Features}
+```{r explore unused features}
 unused = train_dat@Dimnames[[2]][!train_dat@Dimnames[[2]] %in% imp$Feature]
 unused[-grep("pitcher?|batter?",unused)]
 ```
@@ -293,7 +297,7 @@ unused[-grep("pitcher?|batter?",unused)]
 So a fair number of non-ID features are ignored as well, mostly related to pitch usage rate and base states.
 
 Because so many pitcher/batter features are unused, next we want to see if we can adjust our masking threshold to something more useful for the model. So let's compare the total pitches of used and unused pitchers and batters.
-```{r Set Higher Pitch Thresholds}
+```{r set higher pitch thresholds}
 used_pitchers = substr(imp$Feature[grep("pitcher?",imp$Feature)],8,13)
 used_batters = substr(imp$Feature[grep("batter?",imp$Feature)],7,12)
 
@@ -308,7 +312,7 @@ summary(b_agg[!batter %in% used_batters,"P.bat"])
 
 The mean pitch count for both pitchers and batters that are used in the model is significantly higher than those without. So we'll try raising the threshhold and respecifying the model to see if we can lower our CV error.
 
-```{r Train Dat for Higher Thresholds}
+```{r train data for higher thresholds}
 i = 2
 train_dat_list = list(train_dat)
 for(n in c(1000,2000)){
@@ -334,12 +338,12 @@ for(n in c(1000,2000)){
 ```
 
 With training data for the higher thresholds in place, we'll now re-tune the model with the 2 new training data matricies to find the optimum number of iterations. Given how close our results were last time, it's probably wise to grid search this over a depth of both 1 and 2.
-```{r Grid Search with Different Thresholds}
+```{r grid search with different thresholds, cache = TRUE}
 threshold_tune = list()
 rnum = length(tunecv)+1
 
 depth = c(1,2)
-#tune_results$masking_threshold = 200
+tune_results$masking_threshold = 200
 for(d in depth){
   for(td in 2:3){
     tunecv[[rnum]] = xgb.cv(data = train_dat_list[[td]]
@@ -364,7 +368,7 @@ for(d in depth){
     rnum = rnum+1  }
 }
 ```
-```{r}
+```{r plot third grid search}
 plotdat2 = data.table()
 for(i in 1:length(tunecv)){
   if(tune_results$masking_threshold[i] != 200){
