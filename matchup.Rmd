@@ -11,6 +11,7 @@ library(baseballr) # installed from github.com/BillPetti/baseballr
 library(data.table) # use data.table package to optimize speed
 library(ggplot2)
 library(Matrix)
+library(xgboost)
 ```
 
 ## Data Preparation
@@ -96,7 +97,7 @@ events = sc[woba_denom == 1
                   ,base_state = as.factor(paste0(ifelse(is.na(on_1b),"1","_")
                                                  ,ifelse(is.na(on_2b),"2","_")
                                                  ,ifelse(is.na(on_3b),"3","_")))
-                  ,on_base = ifelse(woba_value > 0,1,0)
+                  ,woba_value
                   )
             ]
 str(events)
@@ -148,7 +149,7 @@ Now that our data is ready, we can prepare it for our model by converting to a m
 
 ```{r Convert to Matrix}
 options(na.action='na.pass')
-train_dat = sparse.model.matrix(on_base~.,data = model_dat)
+train_dat = sparse.model.matrix(woba_value~.,data = model_dat)
 dim(train_dat)
 ```
 
@@ -156,15 +157,18 @@ Now we'll set up an initial grid search. R doesn't have good support of grid sea
 
 The first thing we want to determine is the optimum tree depth (interactions). So we'll begin by searching over tree depths of various lengths with a high learning rate.
 
+```{r Set Up Grid Search}
+#create a data frame to store the output of the tuning exercies
+tune_results = data.frame()
+tunecv = list()
+rnum = 1
+```
+
+
 ```{r First Grid Search}
 # Set the preliminary tuning parameters
 d = seq(1,7,2)
-lr = c(0.3,.1,.05)
-
-#create a data frame to store the output of the tuning exercies
-tune_results = data.frame(depth = 0,lr = 0.0,min_error = 0,best_iter = 0)
-tunecv = list()
-rnum = 1
+lr = c(.1)
 
 # begin by identifying the best tree depth
 for(i in 1:length(d)){
@@ -174,34 +178,104 @@ for(i in 1:length(d)){
     
     # calculate cross-validated tuning metrics
     tunecv[[rnum]] = xgb.cv(data = train_dat
-                            ,label = model_dat$on_base
+                            ,label = model_dat$woba_value
                             ,max.depth = d[i]
                             ,eta = lr[j]
-                            ,nround = 15000
-                            ,objective = "binary:logistic"
+                            ,nround = 5000
+                            ,objective = "reg:squarederror"
                             ,nfold = 5
-                            ,verbose = TRUE
                             ,early_stopping_rounds = 100
+                            ,verbose = TRUE
                             ,print_every_n = 100
                             )
     
     #add data to the output variable
-    tune_results[rnum,] = c(d[i],lr[j]
-        ,min(tunecv[[rnum]]$evaluation_log$test_error_mean)
-        ,tunecv[[rnum]]$best_iter)
+    tune_results = rbind(tune_results
+      ,data.frame(depth = d[i]
+                  ,lr = lr[j]
+                  ,min_err = min(tunecv[[rnum]]$evaluation_log$test_rmse_mean)
+                  ,best_iter = tunecv[[rnum]]$best_iter))
     rnum = rnum+1
   }
 }
 ```
-```{r}
+```{r Plot First Grid Search}
 plotdat = data.table()
 for(i in 1:length(tunecv)){
   plotdat = rbind(plotdat
-                  ,data.table(test_error = tunecv[[i]]$evaluation_log$test_error_mean
+                  ,data.table(test_rmse = tunecv[[i]]$evaluation_log$test_rmse_mean
                               ,params = paste0("d:",tunecv[[i]]$params$max_depth
                                                ,"_lr:",tunecv[[i]]$params$eta)
                               ,iter = tunecv[[i]]$evaluation_log$iter))
 }
-ggplot(plotdat,aes(iter,test_error,color = params))+geom_line()
+ggplot(plotdat,aes(iter,test_rmse,color = params))+geom_line() 
+
+plotdat[test_rmse == min(test_rmse)]
+```
+
+We'll refine the grid search now by eliminating the larger tree depths that didn't perform well and trying lower learning rates.
+
+```{r Second Grid Search}
+# Set the preliminary tuning parameters
+d = 1:3
+lr = c(.05,.025,.01)
+
+# begin by identifying the best tree depth
+for(i in 1:length(d)){
+  for(j in 1:length(lr)){
+    
+    print(paste("Depth of",d[i],"and learning rate of",lr[j]))
+    
+    # calculate cross-validated tuning metrics
+    tunecv[[rnum]] = xgb.cv(data = train_dat
+                            ,label = model_dat$woba_value
+                            ,max.depth = d[i]
+                            ,eta = lr[j]
+                            ,nround = 5000
+                            ,objective = "reg:squarederror"
+                            ,nfold = 5
+                            ,early_stopping_rounds = 100
+                            ,verbose = TRUE
+                            ,print_every_n = 100
+                            )
+    
+    #add data to the output variable
+    tune_results = rbind(tune_results
+      ,data.frame(depth = d[i]
+                  ,lr = lr[j]
+                  ,min_err = min(tunecv[[rnum]]$evaluation_log$test_rmse_mean)
+                  ,best_iter = tunecv[[rnum]]$best_iter))
+    rnum = rnum+1
+  }
+}
+```
+```{r Plot Second Grid Search}
+plotdat = data.table()
+for(i in 1:length(tunecv)){
+  if(tunecv[[i]]$params$max_depth <= 3){
+      plotdat = rbind(plotdat
+                  ,data.table(test_rmse = tunecv[[i]]$evaluation_log$test_rmse_mean
+                              ,params = paste0("d:",tunecv[[i]]$params$max_depth
+                                               ,"_lr:",tunecv[[i]]$params$eta)
+                              ,iter = tunecv[[i]]$evaluation_log$iter))
+  }
+}
+ggplot(plotdat[test_rmse < .51142],aes(iter,test_rmse,color = params))+geom_line() + 
+  coord_cartesian(ylim = c(.5113,.5115))
+
+plotdat[test_rmse == min(test_rmse)]
+```
+
+```{r Train Model}
+model.xgb = xgboost(data = train_dat
+                    ,label = model_dat$woba_value
+                    ,max.depth = 2
+                    ,eta = .025
+                    ,nround = 342
+                    ,objective = "reg:squarederror"
+                    ,metric = "rmse"
+                    ,verbose = TRUE
+                    ,print_every_n = 50)
+```
 ```
 
