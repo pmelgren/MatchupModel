@@ -207,7 +207,8 @@ for(i in 1:length(tunecv)){
                   ,data.table(test_rmse = tunecv[[i]]$evaluation_log$test_rmse_mean
                               ,params = paste0("d:",tunecv[[i]]$params$max_depth
                                                ,"_lr:",tunecv[[i]]$params$eta)
-                              ,iter = tunecv[[i]]$evaluation_log$iter))
+                              ,iter = tunecv[[i]]$evaluation_log$iter
+                              ,features = "all"))
 }
 ggplot(plotdat,aes(iter,test_rmse,color = params))+ geom_line() + 
   coord_cartesian(ylim = c(.511,.52))
@@ -217,7 +218,7 @@ plotdat[test_rmse == min(test_rmse)]
 
 We'll refine the grid search now by eliminating the larger tree depths that didn't perform well and trying lower learning rates.
 
-```{r second grid search, cache = TRUE}
+```{r refined grid search, cache = TRUE}
 # Set the preliminary tuning parameters
 d = 1:3
 lr = c(.05,.025,.01)
@@ -246,12 +247,13 @@ for(i in 1:length(d)){
       ,data.frame(depth = d[i]
                   ,lr = lr[j]
                   ,min_err = min(tunecv[[rnum]]$evaluation_log$test_rmse_mean)
-                  ,best_iter = tunecv[[rnum]]$best_iter))
+                  ,best_iter = tunecv[[rnum]]$best_iter
+                  ,features = "all"))
     rnum = rnum+1
   }
 }
 ```
-```{r plot second grid search}
+```{r plot refined grid search}
 plotdat = data.table()
 for(i in 1:length(tunecv)){
   if(tunecv[[i]]$params$max_depth <= 3){
@@ -285,71 +287,32 @@ model.xgb = xgboost(data = train_dat
 imp = xgb.importance(train_dat@Dimnames[[2]], model = model.xgb)
 imp
 ```
+It stands out that a lot of features don't appear in the model, so we're going to remove all but the pitcher/batter woba and game situational factors as those seem to matter the most here.
 
-A few things stand out. First of all, 97% of the model gain is explained by pitcher and batter average wOBA. It makes sense that wOBA at a aggregate level would explain wOBA at a plate-appearance level. It also helps to explain why the model gains are so small after the initial iteration. 
-Secondly, we see that only 55 of the 1180 features are used at all. My suspicion is that the unused features are almost entirely pitcher and batter id's, but let's verify this. 
-
-```{r explore unused features}
-unused = train_dat@Dimnames[[2]][!train_dat@Dimnames[[2]] %in% imp$Feature]
-unused[-grep("pitcher?|batter?",unused)]
-```
-
-So a fair number of non-ID features are ignored as well, mostly related to pitch usage rate and base states.
-
-Because so many pitcher/batter features are unused, next we want to see if we can adjust our masking threshold to something more useful for the model. So let's compare the total pitches of used and unused pitchers and batters.
-```{r set higher pitch thresholds}
-used_pitchers = substr(imp$Feature[grep("pitcher?",imp$Feature)],8,13)
-used_batters = substr(imp$Feature[grep("batter?",imp$Feature)],7,12)
-
-print("Used Features")
-summary(p_agg[pitcher %in% used_pitchers,"P.pit"])
-summary(b_agg[batter %in% used_batters,"P.bat"])
-
-print("Unused Features")
-summary(p_agg[!pitcher %in% used_pitchers,"P.pit"])
-summary(b_agg[!batter %in% used_batters,"P.bat"])
-```
-
-The mean pitch count for both pitchers and batters that are used in the model is significantly higher than those without. So we'll try raising the threshhold and respecifying the model to see if we can lower our CV error.
-
-```{r train data for higher thresholds}
-i = 2
+We expect the same basic tuning parameters to optimize this model as well, but we will go ahead and re-tune using this new dataset just to make sure.
+```{r train data for simple feature set, cache = TRUE}
 train_dat_list = list(train_dat)
-for(n in c(1000,2000)){
-  # convert pitcher and batter back to characters
-  model_dat[,pitcher := as.character(pitcher)]
-  model_dat[,batter := as.character(batter)]
-  
-  
-  # mask pitcher and batter ID's with fewer than 200 pitches
-  model_dat[P.pit < n, pitcher := "0"]
-  model_dat[P.bat < n, batter := "0"]
-  
-  # convert to factors to indicate they're categorical variables
-  model_dat[,pitcher := as.factor(pitcher)]
-  model_dat[,batter := as.factor(batter)]
-  
-  # convert to a sparse model matrix using the higher threshold
-  train_dat_list[[i]]= sparse.model.matrix(woba_value~.,data = model_dat)
-  print(dim(train_dat_list[[i]]))
-  
-  i = i+1
-}
-```
 
-With training data for the higher thresholds in place, we'll now re-tune the model with the 2 new training data matricies to find the optimum number of iterations. Given how close our results were last time, it's probably wise to grid search this over a depth of both 1 and 2.
-```{r grid search with different thresholds, cache = TRUE}
-threshold_tune = list()
+# convert to a sparse model matrix using the higher threshold
+train_dat_list[[2]]= model.matrix(woba_value~wOBA.pit+wOBA.bat+outs+inning+
+                                    base_state+score_diff
+                                         ,data = model_dat)
+print(dim(train_dat_list[[2]]))
+
+
 rnum = length(tunecv)+1
+d = 1:5
+lr = c(.1,.05,.025)
 
-depth = c(1,2)
-tune_results$masking_threshold = 200
-for(d in depth){
-  for(td in 2:3){
-    tunecv[[rnum]] = xgb.cv(data = train_dat_list[[td]]
+for(i in 1:length(d)){
+  for(j in 1:length(lr)){
+    
+    print(paste("Depth of",d[i],"and learning rate of",lr[j]))
+
+    tunecv[[rnum]] = xgb.cv(data = train_dat_list[[2]]
                             ,label = model_dat$woba_value
-                            ,max.depth = d
-                            ,eta = .025
+                            ,max.depth = d[i]
+                            ,eta = lr[j]
                             ,nround = 5000
                             ,objective = "reg:squarederror"
                             ,nfold = 5
@@ -358,35 +321,148 @@ for(d in depth){
                             ,print_every_n = 100
                             )
     tune_results = rbind(tune_results
-      ,data.frame(depth = d
-                  ,lr = .025
+      ,data.frame(depth = d[i]
+                  ,lr = lr[j]
                   ,min_err = min(tunecv[[rnum]]$evaluation_log$test_rmse_mean)
                   ,best_iter = tunecv[[rnum]]$best_iter
-                  ,masking_threshold = ifelse(td == 2,1000,2000)
+                  ,features = "wOBA/situational"
                   )
       )
-    rnum = rnum+1  }
+    rnum = rnum+1  
+  }
 }
 ```
-```{r plot third grid search}
+```{r plot grid search of simple feature set}
 plotdat2 = data.table()
 for(i in 1:length(tunecv)){
-  if(tune_results$masking_threshold[i] != 200){
+  if(tune_results$features == "wOBA/situational"){
       plotdat2 = rbind(plotdat2
         ,data.table(test_rmse = tunecv[[i]]$evaluation_log$test_rmse_mean
                     ,params = paste0("d:",tunecv[[i]]$params$max_depth
                                                ,"_lr:",tunecv[[i]]$params$eta)
-                    ,masking_threshold = as.character(tune_results$masking_threshold[i])
                     ,iter = tunecv[[i]]$evaluation_log$iter))
   }
 }
-ggplot(plotdat2,aes(iter,test_rmse, color = params
-                    ,linetype = masking_threshold)) +
+ggplot(plotdat2,aes(iter,test_rmse, color = params)) +
   geom_line() + coord_cartesian(ylim = c(.51,.52))
 
 print("Best iteration from new thresholds:")
 print.data.frame(plotdat2[test_rmse == min(test_rmse)])
 print("Best iteration from original threshold:")
 print.data.frame(plotdat[test_rmse == min(test_rmse)])
+
+best2 = which(tune_results$min_err == min(tune_results$min_err))
+```
+
+```{r specify 2nd model}
+if(best2 != best){
+  orig_model = model.xgb # preserve old model
+  model.xgb = xgboost(data = train_dat_list[[2]]
+                      ,label = model_dat$woba_value
+                      ,max.depth = tune_results$depth[best2]
+                      ,eta = tune_results$lr[best2]
+                      ,nround = tune_results$best_iter[best2]
+                      ,objective = "reg:squarederror"
+                      ,metric = "rmse"
+                      ,verbose = TRUE
+                      ,print_every_n = 50) # tune new model
+}
+```
+
+```{r feature importance #2}
+imp = xgb.importance(colnames(train_dat_list[[2]]), model = model.xgb)
+imp
+```
+
+Since this model does use different parameters, including a different tree depth, we'll try introducing a few other variables now. Specifically, I'm still not convinced handedness doesn't matter, so we'll introduce that to see if it sticks.
+```{r grid search handedness back, cache = TRUE}
+
+# convert to a sparse model matrix using the higher threshold
+train_dat_list[[3]]= model.matrix(woba_value~wOBA.pit+wOBA.bat+outs+inning+
+                                    base_state+score_diff+p_throws+b_side
+                                         ,data = model_dat)
+print(dim(train_dat_list[[3]]))
+
+
+rnum = length(tunecv)+1
+d = 1:3
+lr = c(.1,.05,.025)
+
+for(i in 1:length(d)){
+  for(j in 1:length(lr)){
+    
+    print(paste("Depth of",d[i],"and learning rate of",lr[j]))
+
+    tunecv[[rnum]] = xgb.cv(data = train_dat_list[[2]]
+                            ,label = model_dat$woba_value
+                            ,max.depth = d[i]
+                            ,eta = lr[j]
+                            ,nround = 5000
+                            ,objective = "reg:squarederror"
+                            ,nfold = 5
+                            ,early_stopping_rounds = 100
+                            ,verbose = TRUE
+                            ,print_every_n = 100
+                            )
+    tune_results = rbind(tune_results
+      ,data.frame(depth = d[i]
+                  ,lr = lr[j]
+                  ,min_err = min(tunecv[[rnum]]$evaluation_log$test_rmse_mean)
+                  ,best_iter = tunecv[[rnum]]$best_iter
+                  ,features = "wOBA/situational/handedness"
+                  )
+      )
+    rnum = rnum+1  
+  }
+}
+```
+
+```{r plot grid search with handedness back}
+plotdat3 = data.table()
+for(i in 1:length(tunecv)){
+  if(tune_results$features == "wOBA/situational/handedness"){
+      plotdat3 = rbind(plotdat3
+        ,data.table(test_rmse = tunecv[[i]]$evaluation_log$test_rmse_mean
+                    ,params = paste0("d:",tunecv[[i]]$params$max_depth
+                                               ,"_lr:",tunecv[[i]]$params$eta)
+                    ,iter = tunecv[[i]]$evaluation_log$iter))
+  }
+}
+ggplot(plotdat3,aes(iter,test_rmse, color = params)) +
+  geom_line() + coord_cartesian(ylim = c(.51,.52))
+
+print("Best iteration with handedness features:")
+print.data.frame(plotdat3[test_rmse == min(test_rmse)])
+print("Best iteration without handedness features:")
+print.data.frame(plotdat2[test_rmse == min(test_rmse)])
+
+best3 = which(tune_results$min_err == min(tune_results$min_err))
+```
+
+```{r specify 3rd model}
+if(best2 != best){
+  models = list(all_features = orig_model
+                ,no_id_or_handedness = model.xgb) # preserve old model
+  models$handedness = xgboost(data = train_dat_list[[3]]
+                              ,label = model_dat$woba_value
+                              ,max.depth = tune_results$depth[best3]
+                              ,eta = tune_results$lr[best3]
+                              ,nround = tune_results$best_iter[best3]
+                              ,objective = "reg:squarederror"
+                              ,metric = "rmse"
+                              ,verbose = TRUE
+                              ,print_every_n = 50) # tune new model
+}
+```
+
+```{r feature importance #3}
+imp = xgb.importance(colnames(train_dat_list[[3]]), model = models$handedness)
+imp
+```
+
+At this point we could continue to fine-tune this model, but gains will remain minimal and we have a model that uses a simple but intuitive feature set so we will save this model for future use.
+
+```{r save model}
+xgb.save(models$handedness,"Matchup.model")
 ```
 
