@@ -164,10 +164,9 @@ tunecv = list()
 rnum = 1
 ```
 
-
 ```{r First Grid Search}
 # Set the preliminary tuning parameters
-d = seq(1,7,2)
+d = seq(1,3,2)
 lr = c(.1)
 
 # begin by identifying the best tree depth
@@ -217,7 +216,7 @@ We'll refine the grid search now by eliminating the larger tree depths that didn
 
 ```{r Second Grid Search}
 # Set the preliminary tuning parameters
-d = 1:3
+d = 1:2
 lr = c(.05,.025,.01)
 
 # begin by identifying the best tree depth
@@ -277,5 +276,113 @@ model.xgb = xgboost(data = train_dat
                     ,verbose = TRUE
                     ,print_every_n = 50)
 ```
+
+```{r Feature Importance}
+imp = xgb.importance(train_dat@Dimnames[[2]], model = model.xgb)
+imp
+```
+
+A few things stand out. First of all, 97% of the model gain is explained by pitcher and batter average wOBA. It makes sense that wOBA at a aggregate level would explain wOBA at a plate-appearance level. It also helps to explain why the model gains are so small after the initial iteration. 
+Secondly, we see that only 55 of the 1180 features are used at all. My suspicion is that the unused features are almost entirely pitcher and batter id's, but let's verify this. 
+
+```{r Explore Unused Features}
+unused = train_dat@Dimnames[[2]][!train_dat@Dimnames[[2]] %in% imp$Feature]
+unused[-grep("pitcher?|batter?",unused)]
+```
+
+So a fair number of non-ID features are ignored as well, mostly related to pitch usage rate and base states.
+
+Because so many pitcher/batter features are unused, next we want to see if we can adjust our masking threshold to something more useful for the model. So let's compare the total pitches of used and unused pitchers and batters.
+```{r Set Higher Pitch Thresholds}
+used_pitchers = substr(imp$Feature[grep("pitcher?",imp$Feature)],8,13)
+used_batters = substr(imp$Feature[grep("batter?",imp$Feature)],7,12)
+
+print("Used Features")
+summary(p_agg[pitcher %in% used_pitchers,"P.pit"])
+summary(b_agg[batter %in% used_batters,"P.bat"])
+
+print("Unused Features")
+summary(p_agg[!pitcher %in% used_pitchers,"P.pit"])
+summary(b_agg[!batter %in% used_batters,"P.bat"])
+```
+
+The mean pitch count for both pitchers and batters that are used in the model is significantly higher than those without. So we'll try raising the threshhold and respecifying the model to see if we can lower our CV error.
+
+```{r Train Dat for Higher Thresholds}
+i = 2
+train_dat_list = list(train_dat)
+for(n in c(1000,2000)){
+  # convert pitcher and batter back to characters
+  model_dat[,pitcher := as.character(pitcher)]
+  model_dat[,batter := as.character(batter)]
+  
+  
+  # mask pitcher and batter ID's with fewer than 200 pitches
+  model_dat[P.pit < n, pitcher := "0"]
+  model_dat[P.bat < n, batter := "0"]
+  
+  # convert to factors to indicate they're categorical variables
+  model_dat[,pitcher := as.factor(pitcher)]
+  model_dat[,batter := as.factor(batter)]
+  
+  # convert to a sparse model matrix using the higher threshold
+  train_dat_list[[i]]= sparse.model.matrix(woba_value~.,data = model_dat)
+  print(dim(train_dat_list[[i]]))
+  
+  i = i+1
+}
+```
+
+With training data for the higher thresholds in place, we'll now re-tune the model with the 2 new training data matricies to find the optimum number of iterations. Given how close our results were last time, it's probably wise to grid search this over a depth of both 1 and 2.
+```{r Grid Search with Different Thresholds}
+threshold_tune = list()
+rnum = length(tunecv)+1
+
+depth = c(1,2)
+#tune_results$masking_threshold = 200
+for(d in depth){
+  for(td in 2:3){
+    tunecv[[rnum]] = xgb.cv(data = train_dat_list[[td]]
+                            ,label = model_dat$woba_value
+                            ,max.depth = d
+                            ,eta = .025
+                            ,nround = 5000
+                            ,objective = "reg:squarederror"
+                            ,nfold = 5
+                            ,early_stopping_rounds = 100
+                            ,verbose = TRUE
+                            ,print_every_n = 100
+                            )
+    tune_results = rbind(tune_results
+      ,data.frame(depth = d
+                  ,lr = .025
+                  ,min_err = min(tunecv[[rnum]]$evaluation_log$test_rmse_mean)
+                  ,best_iter = tunecv[[rnum]]$best_iter
+                  ,masking_threshold = ifelse(td == 2,1000,2000)
+                  )
+      )
+    rnum = rnum+1  }
+}
+```
+```{r}
+plotdat2 = data.table()
+for(i in 1:length(tunecv)){
+  if(tune_results$masking_threshold[i] != 200){
+      plotdat2 = rbind(plotdat2
+        ,data.table(test_rmse = tunecv[[i]]$evaluation_log$test_rmse_mean
+                    ,params = paste0("d:",tunecv[[i]]$params$max_depth
+                                               ,"_lr:",tunecv[[i]]$params$eta)
+                    ,masking_threshold = as.character(tune_results$masking_threshold[i])
+                    ,iter = tunecv[[i]]$evaluation_log$iter))
+  }
+}
+ggplot(plotdat2,aes(iter,test_rmse, color = params
+                    ,linetype = masking_threshold)) +
+  geom_line() + coord_cartesian(ylim = c(.51,.52))
+
+print("Best iteration from new thresholds:")
+print.data.frame(plotdat2[test_rmse == min(test_rmse)])
+print("Best iteration from original threshold:")
+print.data.frame(plotdat[test_rmse == min(test_rmse)])
 ```
 
